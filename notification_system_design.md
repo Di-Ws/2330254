@@ -9,7 +9,7 @@ To provide a complete user notification experience upon logging in, the platform
 
 ---
 
-2. REST API Design Contract s
+2. REST API Design Contract 
 
  A. Fetch User Notifications
 * **Endpoint:** `GET /v1/notifications`
@@ -259,6 +259,51 @@ DO UPDATE SET
     updated_at = CURRENT_TIMESTAMP;
 
     ---
+
+Stage 3
+
+## 1. Analysis of the Existing Query
+
+### Is this query accurate?
+**Yes, structurally.** The query is syntactically sound and correctly filters by the target student and unread status while ordering by time. However, architectural flaws make it unusable at scale.
+
+### Why is this query performing slowly?
+1. **Full Table Scan (High I/O Cost):** With 5,000,000 rows and no dedicated indexes on `studentID` or `isRead`, the database engine is forced to scan every single data page on disk from row 1 to 5,000,000 to find matches.
+2. **Heavy Sorting Overhead:** The `ORDER BY createdAt DESC` clause forces the database to sort the filtered records in memory or via temporary disk files. Without an index to provide pre-sorted data, this operation stalls completely at 5,000,000 records.
+3. **The `SELECT *` Antipattern:** Pulling all columns indiscriminately blocks the database from utilizing lean index-only scans, unnecessarily inflating network payload size and disk read buffers.
+
+---
+
+## 2. Structural Mismatch & Indexing Evaluation
+
+### Evaluation of Advice: "Add indexes on every single column"
+**No, this advice is highly counterproductive and dangerous for a notification system.**
+
+* **The Problem with Over-Indexing:** While adding individual indexes on every column speeds up specific single-column read searches, it severely degrades **Write Performance**. Every single time a new notification is sent (`INSERT`) or marked as read (`UPDATE`), the database engine must simultaneously modify every single index tree across the board.
+* **Low Cardinality Pitfall:** Indexing boolean fields like `isRead` individually is ineffective. Booleans have low cardinality (only two possible values: true or false), meaning the database engine will likely ignore the index entirely and default back to a full table scan.
+
+### What should be changed instead?
+Instead of individual single-column indexes, a single **Composite (Multi-Column) Index** or a **Partial Index** must be created to target the exact query blueprint.
+
+sql
+-- Optimal Solution: A Composite B-Tree Index covering the search criteria
+CREATE INDEX idx_notifications_student_unread 
+ON notifications(studentID, isRead, createdAt DESC);]
+
+Impact on Computation Cost:Before Indexing: Computational cost is $O(N)$ where $O(5,000,000)$ operations are performed for every single API fetch.After Composite Indexing: Computational cost drops exponentially to $O(\log N)$ for the lookup, and $O(1)$ for retrieval since the index keeps data pre-sorted by createdAt DESC
+
+## 3 Advanced Analytical Query (Last 7 Days Placement Fetch)
+To fetch all unique student records who received a "Placement" notification type within the trailing 7 days, we use relative interval time computations alongside explicit filtering constraints.
+
+SELECT DISTINCT studentID
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+ORDER BY studentID ASC;
+
+DISTINCT studentID: Ensures each student is returned exactly once, preventing duplications if a single student received multiple placement updates.
+
+Dynamic Date Range Handler: Using CURRENT_TIMESTAMP - INTERVAL '7 days' computes ranges dynamically on execution, allowing the database query planner to leverage any existing time-series indexes on the createdAt column efficiently.
 
 
 
