@@ -306,5 +306,50 @@ DISTINCT studentID: Ensures each student is returned exactly once, preventing du
 Dynamic Date Range Handler: Using CURRENT_TIMESTAMP - INTERVAL '7 days' computes ranges dynamically on execution, allowing the database query planner to leverage any existing time-series indexes on the createdAt column efficiently.
 
 
+"Stage 4 High-Availability and Caching Strategies"
 
+## 1. System Diagnosis
+Fetching notification records from the primary database on every single page load creates an anti-pattern known as a **Read-Heavy Bottleneck**. As active user concurrent sessions scale, the database connection pool starves, disk I/O hits 100% saturation, and read queries stall—causing cascading API latencies across the entire application workspace.
+
+---
+
+## 2. Proposed Architectural Solutions
+
+To alleviate primary database pressure and improve user experience, we evaluate three major strategies:
+
+### Strategy A: Cache-Aside Pattern with an In-Memory Database (Redis)
+Introduce an in-memory key-value cache store between the application backend application server and the database.
+* **Mechanism:** When a student loads a page, the application server checks Redis first (`Key: student:notif:1042`). If the data is present (Cache Hit), it returns immediately. If missing (Cache Miss), it reads from the primary SQL database, stores the result back in Redis with a Time-To-Live (TTL) expiration, and serves the user.
+* **Trade-offs:**
+    * **Pros:** Blazing-fast response times (< 2ms lookup); drops DB read operations by up to 90%.
+    * **Cons:** Introduces cash invalidation complexities (when a new notification is added, the code must actively clear or update the Redis key to prevent stale data).
+
+### Strategy B: Debounce or Local Storage Debouncing (Client-Side Caching)
+Settle short-term state properties inside the browser application shell using `localStorage` or `sessionStorage`.
+* **Mechanism:** When a user switches pages internally within the application web client, look at the last update timestamp. If less than 60 seconds have passed, skip making an HTTP network request entirely and read the previous notification state payload from client memory.
+* **Trade-offs:**
+    * **Pros:** Zero network latency or execution costs for rapid internal page clicks; drastically lowers total network requests striking the API gateway.
+    * **Cons:** If an urgent security alert or instant critical notification triggers, the student might experience a small delivery delay until the local client cache interval lapses.
+
+### Strategy C: Event-Driven Push Synchronization (SSE/WebSockets Retention)
+Transition from active polling/fetching to maintaining an active, memory-driven communication pipeline.
+* **Mechanism:** Establish a Server-Sent Events (SSE) socket channel on login. The application server retains active state in temporary server memory arrays. Instead of querying the database on every page mount, the database is only queried once on first login; subsequent alerts are pushed directly down the stream socket.
+* **Trade-offs:**
+    * **Pros:** Eliminates recurring page-load query traffic entirely.
+    * **Cons:** Increases server memory utilization profiles due to maintaining continuous connection ports open for thousands of parallel users.
+
+---
+
+## 3. Comparative Architecture Assessment Matrix
+
+| Metrics & Considerations | Strategy A: Redis Cache-Aside | Strategy B: Client-Side Caching | Strategy C: SSE Push Pipe |
+| :--- | :--- | :--- | :--- |
+| **Primary DB Relief** | **Excellent** (Intercepts majority of reads) | **Moderate** (Relies on user behavior models) | **Exceptional** (Reads once upon loading) |
+| **Data Freshness** | High (When matched with explicit eviction) | Delayed (Bound to local interval timers) | **Instant** (Real-time distribution stream) |
+| **Infrastructure Overhead** | High (Requires managing a Redis instance) | **None** (Handled natively by browser) | Moderate (Requires persistent state ports) |
+
+---
+
+## 4. Implementation Verdict
+The ideal corporate production rollout combines **Strategy A (Redis Caching)** alongside the **SSE Pattern** designed in Stage 1. This ensures that even if a socket drops and forces a client-side layout reload, the incoming request terminates safely inside an in-memory Redis cache node, keeping your primary database footprint safe, steady, and insulated.
 
