@@ -1,0 +1,265 @@
+Stage 1
+
+1. Core Actions Supported by the Platform
+To provide a complete user notification experience upon logging in, the platform supports the following operations:
+**Fetch Notifications:** Retrieves unread and read notifications for the authenticated user.
+ **Mark as Read/Archive:** Allows the client to clear notifications once viewed.
+**Preferences Management:** Allows users to opt-in or opt-out of specific channels (Email, Push, SMS).
+ **Real-time Stream:** Sustains an open channel to push live notifications to the UI instantly without polling.
+
+---
+
+2. REST API Design Contract
+
+ A. Fetch User Notifications
+* **Endpoint:** `GET /v1/notifications`
+* **Description:** Retrieves a paginated list of notifications for the logged-in user.
+* **Headers:**
+    ```http
+    Authorization: Bearer <JWT_ACCESS_TOKEN>
+    Accept: application/json
+    ```
+* **Query Parameters:**
+    * `status`: (Optional) Filter by `read` or `unread`.
+    * `limit`: (Optional, default=20) For pagination chunking.
+    * `page`: (Optional, default=1) Current page context.
+
+* **Response Payload (`200 OK`):**
+    ```json
+    {
+      "success": true,
+      "data": {
+        "notifications": [
+          {
+            "id": "notif_883f9a12-9c10-4b53",
+            "title": "Security Alert",
+            "message": "A new login was detected from a new Chrome instance.",
+            "type": "SECURITY",
+            "priority": "HIGH",
+            "isRead": false,
+            "createdAt": "2026-06-03T08:30:00Z"
+          },
+          {
+            "id": "notif_112a7d45-3e89-1a22",
+            "title": "Welcome Pack Loaded",
+            "message": "Your profile verification is fully complete.",
+            "type": "SYSTEM",
+            "priority": "LOW",
+            "isRead": true,
+            "createdAt": "2026-06-03T07:15:00Z"
+          }
+        ],
+        "pagination": {
+          "totalCount": 2,
+          "totalPages": 1,
+          "currentPage": 1,
+          "limit": 20
+        }
+      }
+    }
+    ```
+
+---
+
+### B. Mark Notification as Read
+* **Endpoint:** `PATCH /v1/notifications/:id/read`
+* **Description:** Updates the status of a specific notification instance to prevent double-displaying.
+* **Headers:**
+    ```http
+    Authorization: Bearer <JWT_ACCESS_TOKEN>
+    Content-Type: application/json
+    ```
+* **Response Payload (`200 OK`):**
+    ```json
+    {
+      "success": true,
+      "message": "Notification successfully updated to read state.",
+      "updatedId": "notif_883f9a12-9c10-4b53"
+    }
+    ```
+* **Error Response (`404 Not Found`):**
+    ```json
+    {
+      "success": false,
+      "error": "RESOURCE_NOT_FOUND",
+      "message": "The notification ID specified does not exist or belong to this user account."
+    }
+    ```
+
+---
+
+### C. Update Notification Preferences
+* **Endpoint:** `PUT /v1/notifications/preferences`
+* **Description:** Configures user delivery preferences.
+* **Headers:**
+    ```http
+    Authorization: Bearer <JWT_ACCESS_TOKEN>
+    Content-Type: application/json
+    ```
+* **Request Body JSON Schema:**
+    ```json
+    {
+      "preferences": {
+        "marketingChannels": {
+          "email": false,
+          "push": true,
+          "sms": false
+        },
+        "securityChannels": {
+          "email": true,
+          "push": true,
+          "sms": true
+        }
+      }
+    }
+    ```
+* **Response Payload (`200 OK`):**
+    ```json
+    {
+      "success": true,
+      "message": "User communication preferences saved successfully."
+    }
+    ```
+
+---
+
+## 3. Real-Time Notification Architecture Design
+
+To drop notifications onto the user's screen instantly without constantly hitting our database with heavy HTTP polling loops, the platform implements **Server-Sent Events (SSE)**.
+
+### Why Server-Sent Events (SSE) over WebSockets?
+1. **Unidirectional Simplicity:** Notifications only flow *one way* (from the server down to the logged-in client UI). WebSockets offer bidirectional streaming, which introduces unnecessary overhead.
+2. **Native HTTP Protocol Compatibility:** SSE operates directly over standard HTTP/1.1 or HTTP/2 transport pipes using standard text streaming headers. It bypasses corporate firewalls effortlessly and includes **built-in automatic reconnection handling** handled natively by the browser's `EventSource` API.
+
+### Stream Implementation Spec
+* **Endpoint:** `GET /v1/notifications/stream`
+* **Connection Response Headers Required:**
+    ```http
+    Content-Type: text/event-stream
+    Cache-Control: no-cache
+    Connection: keep-alive
+    ```
+* **Real-time Event Wire Layout Example:**
+    ```text
+    event: new_notification
+    data: {"id": "notif_999", "title": "Live Update", "message": "Your request status shifted to Active."}
+    ```
+    # Stage 2
+
+## 1. Persistent Storage Recommendation & Justification
+
+For an enterprise-scale notification platform, a hybrid storage approach or a high-performance **NoSQL Document Store (like MongoDB)** or **Time-Series / Wide-Column Store (like Cassandra)** is highly ideal. However, since notification system access patterns map directly to core relational constraints (such as users mapping to explicit user records), using a **Relational Database Management System (RDBMS) like PostgreSQL** paired with a caching layer (Redis) offers the highest level of reliability.
+
+### Why PostgreSQL with Redis is selected:
+* **ACID Compliance:** Transaction integrity guarantees that marking a critical notification as "read" updates across all consumer platforms instantly without stale reads or data race conditions.
+* **Efficient Indexing Structures:** High volume reads (filtering by `user_id` and `is_read`) can be optimized to sub-millisecond speeds using structural B-Tree and partial indexes.
+* **JSONB Support:** Offers the flexibility of NoSQL by allowing dynamic payload properties to be stored cleanly inside binary JSON columns, adapting smoothly if notification metadata attributes change.
+
+---
+
+## 2. Relational Database Schema Design (SQL)
+
+Here is the physical database schema written in PostgreSQL syntax. It includes a `users` table, a `notification_preferences` table, and a partitioned-ready `notifications` core tracking log table.
+
+```sql
+-- 1. Users Directory Table
+CREATE TABLE users (
+    user_id VARCHAR(64) PRIMARY KEY,
+    username VARCHAR(100) NOT NULL,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. Notification Main Log Storage Table
+CREATE TABLE notifications (
+    notification_id VARCHAR(64) PRIMARY KEY,
+    user_id VARCHAR(64) NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    message TEXT NOT NULL,
+    type VARCHAR(32) NOT NULL, -- SECURITY, SYSTEM, MARKETING, TRANSACTIONAL
+    priority VARCHAR(16) NOT NULL DEFAULT 'LOW', -- LOW, MEDIUM, HIGH
+    is_read BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 3. User Channel Preferences Table
+CREATE TABLE notification_preferences (
+    preference_id SERIAL PRIMARY KEY,
+    user_id VARCHAR(64) NOT NULL UNIQUE REFERENCES users(user_id) ON DELETE CASCADE,
+    marketing_email BOOLEAN NOT NULL DEFAULT TRUE,
+    marketing_push BOOLEAN NOT NULL DEFAULT TRUE,
+    marketing_sms BOOLEAN NOT NULL DEFAULT FALSE,
+    security_email BOOLEAN NOT NULL DEFAULT TRUE,
+    security_push BOOLEAN NOT NULL DEFAULT TRUE,
+    security_sms BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 4. High Performance Composite and Partial Indexes for Stage 1 Access Patterns
+CREATE INDEX idx_notifications_user_unread 
+ON notifications(user_id) 
+WHERE is_read = FALSE;
+
+CREATE INDEX idx_notifications_created_at 
+ON notifications(created_at DESC);
+
+### 3. Escalating Scale Problems & Solutions
+
+As the user base expands and the volume of notifications reaches millions of rows per week, two significant system bottlenecks occur: 
+
+#### Problem A: Read Amplification & Degraded Query Performance
+* **The Issue:** When fetching unread notifications (`GET /v1/notifications?status=unread`), the database engine must scan expanding indexes or partition data spaces. As table size expands, performance shifts from O(1) or O(log N) toward linear scans, causing API responses to break the latency SLA.
+* **The Solution:** 1. **Partial Indexing:** Implement conditional indexing (`WHERE is_read = FALSE`) so the index tree size remains tiny, capturing only active unread notification payloads.
+  2. **In-Memory Read Cache (Redis):** Cache a counter or full array of unread notification fragments in memory. When a new notification arrives, push it to Redis. The API reads from Redis first, bypassing the disk database entirely for active feed updates.
+
+#### Problem B: Exploding Storage Footprint & Slow Disk I/O
+* **The Issue:** Read/Write operations on a single massive table degrade as old, stale notification logs consume space in active database memory blocks.
+* **The Solution:**
+  1. **Horizontal Database Partitioning:** Partition the `notifications` table by time ranges (e.g., monthly partitions). Active reads and writes target the current months partition table, while historical read logs sit safely on distinct historical storage partitions.
+  2. **Data Retention & Archival Policies:** Implement a worker daemon that offloads read notifications older than 30 days to cold storage objects (like AWS S3 or cheap analytical databases) and deletes them from the main active operation table.
+
+
+  These are the exact queries that bind your database engine to the REST contract endpoints built in Stage 1:
+
+  Query A: Fetch Unread Notifications (For GET /v1/notifications?status=unread)
+
+  Uses explicit pagination boundaries (LIMIT and OFFSET) to safeguard system memory profiles:
+
+  SELECT notification_id, title, message, type, priority, is_read, created_at
+FROM notifications
+WHERE user_id = 'usr_test_12345' 
+  AND is_read = FALSE
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 0;
+
+Query B: Mark Notification as Read (For PATCH /v1/notifications/:id/read)
+Updates state cleanly while validating that the resource belongs strictly to the requesting authenticated user:
+
+UPDATE notifications
+SET is_read = TRUE
+WHERE notification_id = 'notif_883f9a12-9c10-4b53' 
+  AND user_id = 'usr_test_12345'
+RETURNING notification_id;
+
+Query C: Update Preferences (For PUT /v1/notifications/preferences)
+Uses an atomic upsert routine (ON CONFLICT) to safely write new or modify existing database row definitions:
+
+INSERT INTO notification_preferences (
+    user_id, marketing_email, marketing_push, marketing_sms, security_email, security_push, security_sms, updated_at
+) 
+VALUES ('usr_test_12345', FALSE, TRUE, FALSE, TRUE, TRUE, TRUE, CURRENT_TIMESTAMP)
+ON CONFLICT (user_id) 
+DO UPDATE SET 
+    marketing_email = EXCLUDED.marketing_email,
+    marketing_push = EXCLUDED.marketing_push,
+    marketing_sms = EXCLUDED.marketing_sms,
+    security_email = EXCLUDED.security_email,
+    security_push = EXCLUDED.security_push,
+    security_sms = EXCLUDED.security_sms,
+    updated_at = CURRENT_TIMESTAMP;
+
+    ---
+
+
+
+
