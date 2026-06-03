@@ -9,7 +9,7 @@ To provide a complete user notification experience upon logging in, the platform
 
 ---
 
-2. REST API Design Contract
+2. REST API Design Contract s
 
  A. Fetch User Notifications
 * **Endpoint:** `GET /v1/notifications`
