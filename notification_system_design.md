@@ -353,3 +353,48 @@ Transition from active polling/fetching to maintaining an active, memory-driven 
 ## 4. Implementation Verdict
 The ideal corporate production rollout combines **Strategy A (Redis Caching)** alongside the **SSE Pattern** designed in Stage 1. This ensures that even if a socket drops and forces a client-side layout reload, the incoming request terminates safely inside an in-memory Redis cache node, keeping your primary database footprint safe, steady, and insulated.
 
+# Stage 5: Security, Rate Limiting, and Fault Tolerance
+
+## 1. Rate Limiting Strategy (API Abuse Prevention)
+
+To prevent malicious actors or broken client-side loop scripts from hammering the notification endpoints and exhausting server resources, the platform implements a **Sliding Window Counter** rate-limiting pattern backed by Redis.
+
+### Rate Limit Configuration
+* **Authenticated Endpoints (`GET /v1/notifications`):** Max **60 requests per minute** per user ID.
+* **Stream Connection (`GET /v1/notifications/stream`):** Max **5 connection attempts per minute** per user ID to prevent handshake spamming.
+
+### Redis Implementation Mechanism
+1. Each incoming request triggers a Redis transactional evaluation using the user's ID as part of the key structure (e.g., `rate:notif:usr_123`).
+2. If the request count within the current time window exceeds the threshold, the API gateway drops the request immediately, skipping database execution entirely.
+3. **Response Headers for Rate Limited Requests (`429 Too Many Requests`):**
+    ```http
+    HTTP/1.1 429 Too Many Requests
+    Retry-After: 35
+    Content-Type: application/json
+    ```
+    ```json
+    {
+      "success": false,
+      "error": "RATE_LIMIT_EXCEEDED",
+      "message": "Too many requests. Please look at the Retry-After header and wait before retrying."
+    }
+    ```
+
+---
+
+## 2. Platform Security & Data Protection
+
+### A. Authentication & Authorization (AuthN/AuthZ)
+* **JWT Validation:** All endpoints are strictly guarded behind a stateless JSON Web Token (JWT) validation middleware. The token must be provided via the `Authorization: Bearer <TOKEN>` header.
+* **Resource Ownership Verification:** The backend architecture enforces strict context separation. The validated `user_id` is extracted directly from the verified cryptographic JWT payload rather than relying on client-supplied parameters, preventing **IDOR (Insecure Direct Object Reference)** vulnerabilities.
+
+### B. Injection & Cross-Site Scripting (XSS) Prevention
+* **SQL Injection Shielding:** The database access layer uses **Parameterized Queries (Prepared Statements)** exclusively. User input is never concatenated directly into raw SQL strings.
+* **XSS Payload Sanitization:** Because notification components display titles and descriptions dynamically within client UI views, all payload content passes through HTML sanitization libraries (such as `DOMPurify` or server-side input filtering) to strip out malicious script injections (`<script>`, `onerror` handlers) before the data hits persistent storage blocks.
+
+---
+
+## 3. Fault Tolerance & Resiliency Architecture
+
+When delivering notifications through external third-party integrations (e.g., Twilio for SMS, SendGrid for Email, Firebase Cloud Messaging for Push), transient network drops or external vendor outages are inevitable. The platform handles these failures using an asynchronous message queue architecture.
+
